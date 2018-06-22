@@ -157,14 +157,15 @@ static SILBasicBlock *insertBackedgeBlock(SILLoop *L, DominanceInfo *DT,
   L->addBasicBlockToLoop(BEBlock, LI->getBase());
 
   // Update dominator information
-  SILBasicBlock *DomBB = BackedgeBlocks.back();
-  for (auto BBIter = BackedgeBlocks.begin(),
-         BBEnd = std::prev(BackedgeBlocks.end());
-       BBIter != BBEnd; ++BBIter) {
-    DomBB = DT->findNearestCommonDominator(DomBB, *BBIter);
+  if (DT) {
+    SILBasicBlock *DomBB = BackedgeBlocks.back();
+    for (auto BBIter = BackedgeBlocks.begin(),
+           BBEnd = std::prev(BackedgeBlocks.end());
+         BBIter != BBEnd; ++BBIter) {
+      DomBB = DT->findNearestCommonDominator(DomBB, *BBIter);
+    }
+    DT->addNewBlock(BEBlock, DomBB);
   }
-  DT->addNewBlock(BEBlock, DomBB);
-
   return BEBlock;
 }
 
