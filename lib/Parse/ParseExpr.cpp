@@ -1088,38 +1088,6 @@ getMagicIdentifierLiteralKind(tok Kind) {
   }
 }
 
-/// See if type(of: <expr>) can be parsed backtracking on failure.
-static bool canParseTypeOf(Parser &P) {
-  // We parsed `type(of:)` as a special syntactic form in Swift 3. In Swift 4
-  // it is handled by overload resolution.
-  if (!P.Context.LangOpts.isSwiftVersion3())
-    return false;
-
-  if (!(P.Tok.getText() == "type" && P.peekToken().is(tok::l_paren))) {
-    return false;
-  }
-  // Look ahead to parse the parenthesized expression.
-  Parser::BacktrackingScope Backtrack(P);
-  P.consumeToken(tok::identifier);
-  P.consumeToken(tok::l_paren);
-  // The first argument label must be 'of'.
-  if (!(P.Tok.getText() == "of" && P.peekToken().is(tok::colon))) {
-    return false;
-  }
-
-  // Parse to the closing paren.
-  while (!P.Tok.is(tok::r_paren) && !P.Tok.is(tok::eof)) {
-    // Anything that looks like another argument label is bogus.  It is
-    // sufficient to parse for a single trailing comma.  Backtracking will
-    // fall back to an unresolved decl.
-    if (P.Tok.is(tok::comma)) {
-      return false;
-    }
-    P.skipSingle();
-  }
-  return true;
-}
-
 ParserResult<Expr>
 Parser::parseExprPostfixSuffix(ParserResult<Expr> Result, bool isExprBasic,
                                bool periodHasKeyPathBehavior,
@@ -1559,10 +1527,6 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
       
   case tok::identifier:  // foo
   case tok::kw_self:     // self
-    // Attempt to parse for 'type(of: <expr>)'.
-    if (canParseTypeOf(*this)) {
-      return parseExprTypeOf();
-    }
 
     // If we are parsing a refutable pattern and are inside a let/var pattern,
     // the identifiers change to be value bindings instead of decl references.
@@ -1759,27 +1723,6 @@ ParserResult<Expr> Parser::parseExprPrimary(Diag<> ID, bool isExprBasic) {
 
   case tok::l_square:
     return parseExprCollection();
-
-  // SWIFT_ENABLE_TENSORFLOW
-  case tok::pound_gradient:
-    return parseExprGradientBody(ExprKind::Gradient);
-    break;
-      
-  case tok::pound_chainableGradient:
-    return parseExprGradientBody(ExprKind::ChainableGradient);
-    break;
-
-  case tok::pound_valueAndGradient:
-    return parseExprGradientBody(ExprKind::ValueAndGradient);
-    break;
-
-  case tok::pound_adjoint:
-    return parseExprAdjoint();
-    break;
-
-  case tok::pound_assert:
-    return parseExprPoundAssert();
-    break;
 
   case tok::pound_available: {
     // For better error recovery, parse but reject #available in an expr
@@ -2171,22 +2114,6 @@ DeclName Parser::parseUnqualifiedDeclName(bool afterDot,
   return DeclName(Context, baseName, argumentLabels);
 }
 
-static bool shouldAddSelfFixit(DeclContext* Current, DeclName Name,
-                               DescriptiveDeclKind &Kind) {
-  if (Current->isTypeContext() || !Current->getInnermostTypeContext())
-    return false;
-  if (auto *Nominal = Current->getInnermostTypeContext()->
-      getAsNominalTypeOrNominalTypeExtensionContext()){
-    // FIXME: we cannot resolve members appear later in the body of the nominal.
-    auto LookupResults = Nominal->lookupDirect(Name);
-    if (!LookupResults.empty()) {
-      Kind = LookupResults.front()->getDescriptiveKind();
-      return true;
-    }
-  }
-  return false;
-}
-
 ///   expr-identifier:
 ///     unqualified-decl-name generic-args?
 Expr *Parser::parseExprIdentifier() {
@@ -2237,14 +2164,7 @@ Expr *Parser::parseExprIdentifier() {
     } else {
       for (auto activeVar : DisabledVars) {
         if (activeVar->getFullName() == name) {
-          DescriptiveDeclKind Kind;
-          if (DisabledVarReason.ID == diag::var_init_self_referential.ID &&
-              shouldAddSelfFixit(CurDeclContext, name, Kind)) {
-            diagnose(loc.getBaseNameLoc(), diag::expected_self_before_reference,
-                    Kind).fixItInsert(loc.getBaseNameLoc(), "self.");
-          } else {
-            diagnose(loc.getBaseNameLoc(), DisabledVarReason);
-          }
+          diagnose(loc.getBaseNameLoc(), DisabledVarReason);
           return new (Context) ErrorExpr(loc.getSourceRange());
         }
       }
@@ -2469,13 +2389,13 @@ parseClosureSignatureIfPresent(SmallVectorImpl<CaptureListEntry> &captureList,
       SWIFT_DEFER { HasNext = consumeIf(tok::comma); };
       // Check for the strength specifier: "weak", "unowned", or
       // "unowned(safe/unsafe)".
-      SourceLoc loc;
+      SourceLoc ownershipLocStart, ownershipLocEnd;
       auto ownershipKind = ReferenceOwnership::Strong;
       if (Tok.isContextualKeyword("weak")){
-        loc = consumeToken(tok::identifier);
+        ownershipLocStart = ownershipLocEnd = consumeToken(tok::identifier);
         ownershipKind = ReferenceOwnership::Weak;
       } else if (Tok.isContextualKeyword("unowned")) {
-        loc = consumeToken(tok::identifier);
+        ownershipLocStart = ownershipLocEnd = consumeToken(tok::identifier);
         ownershipKind = ReferenceOwnership::Unowned;
 
         // Skip over "safe" and "unsafe" if present.
@@ -2487,14 +2407,13 @@ parseClosureSignatureIfPresent(SmallVectorImpl<CaptureListEntry> &captureList,
             ownershipKind = ReferenceOwnership::Unmanaged;
           else
             diagnose(Tok, diag::attr_unowned_invalid_specifier);
-          consumeIf(tok::identifier);
-          if (!consumeIf(tok::r_paren))
+          consumeIf(tok::identifier, ownershipLocEnd);
+          if (!consumeIf(tok::r_paren, ownershipLocEnd))
             diagnose(Tok, diag::attr_unowned_expected_rparen);
         }
       } else if (Tok.isAny(tok::identifier, tok::kw_self) &&
                  peekToken().isAny(tok::equal, tok::comma, tok::r_square)) {
         // "x = 42", "x," and "x]" are all strong captures of x.
-        loc = Tok.getLoc();
       } else {
         diagnose(Tok, diag::expected_capture_specifier);
         skipUntil(tok::comma, tok::r_square);
@@ -2554,7 +2473,8 @@ parseClosureSignatureIfPresent(SmallVectorImpl<CaptureListEntry> &captureList,
 
       // Attributes.
       if (ownershipKind != ReferenceOwnership::Strong)
-        VD->getAttrs().add(new (Context) ReferenceOwnershipAttr(ownershipKind));
+        VD->getAttrs().add(new (Context) ReferenceOwnershipAttr(
+          SourceRange(ownershipLocStart, ownershipLocEnd), ownershipKind));
 
       auto pattern = new (Context) NamedPattern(VD, /*implicit*/true);
 
@@ -2992,7 +2912,8 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
                                   [&] () -> ParserStatus {
     Identifier FieldName;
     SourceLoc FieldNameLoc;
-    parseOptionalArgumentLabel(FieldName, FieldNameLoc);
+    if (Kind != SyntaxKind::YieldStmt)
+      parseOptionalArgumentLabel(FieldName, FieldNameLoc);
 
     // See if we have an operator decl ref '(<op>)'. The operator token in
     // this case lexes as a binary operator because it neither leads nor
@@ -3511,7 +3432,7 @@ Parser::parseLanguageVersionConstraintSpec() {
   SyntaxParsingContext VersionRestrictionContext(
       SyntaxContext, SyntaxKind::AvailabilityVersionRestriction);
   SourceLoc SwiftLoc;
-  clang::VersionTuple Version;
+  llvm::VersionTuple Version;
   SourceRange VersionRange;
   if (!(Tok.isIdentifierOrUnderscore() && Tok.getText() == "swift"))
     return nullptr;
@@ -3557,7 +3478,7 @@ Parser::parsePlatformVersionConstraintSpec() {
     consumeToken();
   }
 
-  clang::VersionTuple Version;
+  llvm::VersionTuple Version;
   SourceRange VersionRange;
 
   if (parseVersionTuple(Version, VersionRange,
@@ -3579,347 +3500,4 @@ Parser::parsePlatformVersionConstraintSpec() {
 
   return makeParserResult(new (Context) PlatformVersionConstraintAvailabilitySpec(
       Platform.getValue(), PlatformLoc, Version, VersionRange));
-}
-
-/// parseExprTypeOf
-///
-///   expr-dynamictype:
-///     'type' '(' 'of:' expr ')'
-///
-ParserResult<Expr> Parser::parseExprTypeOf() {
-  // In libSyntax parsing, we parse 'type(of: <expr>)' as a normal function call
-  // expression. The semantic AST builder should treat this as a
-  // DynamicTypeExpr.
-  SyntaxParsingContext CallCtxt(SyntaxContext, SyntaxKind::FunctionCallExpr);
-
-  SourceLoc keywordLoc;
-  {
-    SyntaxParsingContext IdentifierExprContext(SyntaxContext,
-                                               SyntaxKind::IdentifierExpr);
-    // Consume 'type'
-    keywordLoc = consumeToken();
-  }
-
-  // Parse the leading '('.
-  SourceLoc lParenLoc = consumeToken(tok::l_paren);
-
-  ParserResult<Expr> subExpr;
-  {
-    SyntaxParsingContext ArgCtxt(SyntaxContext,
-                                 SyntaxKind::FunctionCallArgument);
-    // Parse `of` label.
-    if (Tok.getText() == "of" && peekToken().is(tok::colon)) {
-      // Consume the label.
-      consumeToken();
-      consumeToken(tok::colon);
-    } else {
-      // There cannot be a richer diagnostic here because the user may have
-      // defined a function `type(...)` that conflicts with the magic expr.
-      diagnose(Tok, diag::expr_typeof_expected_label_of);
-    }
-
-    // Parse the subexpression.
-    subExpr = parseExpr(diag::expr_typeof_expected_expr);
-    if (subExpr.hasCodeCompletion())
-      return makeParserCodeCompletionResult<Expr>();
-  }
-  CallCtxt.collectNodesInPlace(SyntaxKind::FunctionCallArgumentList);
-
-  // Parse the closing ')'
-  SourceLoc rParenLoc;
-  if (subExpr.isParseError()) {
-    skipUntilDeclStmtRBrace(tok::r_paren);
-    if (Tok.is(tok::r_paren))
-      rParenLoc = consumeToken();
-    else
-      rParenLoc = PreviousLoc;
-  } else {
-    parseMatchingToken(tok::r_paren, rParenLoc,
-                       diag::expr_typeof_expected_rparen, lParenLoc);
-  }
-
-  // If the subexpression was in error, just propagate the error.
-  if (subExpr.isParseError())
-    return makeParserResult<Expr>(
-      new (Context) ErrorExpr(SourceRange(keywordLoc, rParenLoc)));
-
-  return makeParserResult(
-           new (Context) DynamicTypeExpr(keywordLoc, lParenLoc,
-                                         subExpr.get(), rParenLoc, Type()));
-}
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// parseExprGradientBody
-///   expr-gradient:
-///     '#gradient' expr-gradient-body
-///   expr-value-and-gradient:
-///     '#valueAndGradient' expr-gradient-body
-///   expr-gradient-body:
-///     '('
-///       expr
-///       (',' 'wrt' ':' expr-gradient-param-list)?
-///     ')'
-///   expr-gradient-param-list:
-///     expr-gradient-param-index (',' expr-gradient-param-index)*
-///   expr-gradient-param-index:
-///     '.' [0-9]+
-///
-ParserResult<Expr> Parser::parseExprGradientBody(ExprKind kind) {
-  SyntaxParsingContext RADEContext(SyntaxContext,
-                                   SyntaxKind::ReverseAutoDiffExpr);
-
-  assert(Tok.isAny(tok::pound_gradient, tok::pound_valueAndGradient,
-                   tok::pound_chainableGradient));
-  auto poundGradLoc = consumeToken();
-  SourceLoc lParenLoc;
-  SourceLoc rParenLoc;
-
-  StringRef exprName;
-  switch (kind) {
-  case ExprKind::Gradient:
-    exprName = "#gradient";
-    break;
-  case ExprKind::ChainableGradient:
-    exprName = "#chainableGradient";
-    break;
-  case ExprKind::ValueAndGradient:
-    exprName = "#valueAndGradient";
-    break;
-  default:
-    llvm_unreachable("Not a reverse AD expression");
-  }
-
-  auto errorAndSkipToEnd = [&]() -> ParserResult<Expr> {
-    skipUntilDeclStmtRBrace(tok::r_paren);
-    rParenLoc = Tok.is(tok::r_paren) ? consumeToken() : PreviousLoc;
-    return makeParserResult<Expr>(
-      new (Context) ErrorExpr(SourceRange(poundGradLoc, rParenLoc)));
-  };
-
-  // Parse '('.
-  if (parseToken(tok::l_paren, lParenLoc,
-                 diag::expr_expected_lparen, exprName)) {
-    return errorAndSkipToEnd();
-  }
-  // Parse an expression that represents the function to be differentiated.
-  auto originalFnParseResult =
-    parseExpr(diag::expr_expected_function_to_differentiate);
-  if (originalFnParseResult.hasCodeCompletion())
-    return makeParserCodeCompletionResult<Expr>();
-  if (originalFnParseResult.isParseError())
-    return errorAndSkipToEnd();
-  // If found comma, parse 'wrt:'.
-  SmallVector<AutoDiffIndexParameter, 8> params;
-  if (consumeIf(tok::comma)) {
-    // If 'withRespectTo' is used, make the user change it to 'wrt'.
-    if (Tok.getText() == "withRespectTo") {
-      SourceRange withRespectToRange(Tok.getLoc(), peekToken().getLoc());
-      diagnose(Tok, diag::autodiff_use_wrt_not_withrespectto)
-        .highlight(withRespectToRange)
-        .fixItReplace(withRespectToRange, "wrt:");
-      return errorAndSkipToEnd();
-    }
-    // Parse 'wrt' ':'.
-    if (parseSpecificIdentifier("wrt",
-                                diag::expr_expected_label,
-                                exprName, "wrt:") ||
-        parseToken(tok::colon, diag::expected_parameter_colon))
-      return errorAndSkipToEnd();
-    // Function that parses one parameter.
-    auto parseParam = [&]() -> bool {
-      SyntaxParsingContext DiffParamContext(
-          SyntaxContext, SyntaxKind::ReverseAutoDiffExprParam);
-      SourceLoc paramLoc;
-      switch (Tok.getKind()) {
-      case tok::period_prefix: {
-        SyntaxParsingContext IndexParamContext(
-            SyntaxContext, SyntaxKind::DifferentiationIndexParam);
-        consumeToken(tok::period_prefix);
-        unsigned index;
-        if (parseUnsignedInteger(index, paramLoc,
-                                 diag::gradient_expr_expected_parameter))
-          return true;
-        params.push_back({ paramLoc, index });
-        break;
-      }
-      default:
-        diagnose(Tok, diag::gradient_expr_expected_parameter);
-        return true;
-      }
-      if (Tok.isNot(tok::r_paren))
-        return parseToken(tok::comma, diag::attr_expected_comma, exprName,
-                          /*isDeclModifier=*/false);
-      return false;
-    };
-    // Parse first parameter. At least one is required.
-    if (parseParam())
-      return errorAndSkipToEnd();
-    // Parse remaining parameters until ')'.
-    while (Tok.isNot(tok::r_paren))
-      if (parseParam())
-        return errorAndSkipToEnd();
-    SyntaxContext->collectNodesInPlace(
-        SyntaxKind::ReverseAutoDiffExprParamList);
-  }
-  // Parse the closing ')'.
-  if (parseToken(tok::r_paren, rParenLoc, diag::expr_expected_rparen, exprName))
-    return makeParserResult<Expr>(
-      new (Context) ErrorExpr(SourceRange(poundGradLoc, PreviousLoc)));
-
-  // Successfully parsed a reverse autodiff expression.
-  Expr *result = nullptr;
-  switch (kind) {
-  case ExprKind::Gradient:
-    result = GradientExpr::create(Context, poundGradLoc, lParenLoc,
-                                  originalFnParseResult.get(), params,
-                                  rParenLoc);
-    break;
-  case ExprKind::ChainableGradient:
-    result = ChainableGradientExpr::create(Context, poundGradLoc, lParenLoc,
-                                           originalFnParseResult.get(), params,
-                                           rParenLoc);
-    break;
-  case ExprKind::ValueAndGradient:
-    result = ValueAndGradientExpr::create(Context, poundGradLoc, lParenLoc,
-                                          originalFnParseResult.get(), params,
-                                          rParenLoc);
-    break;
-  default:
-    llvm_unreachable("Not a reverse AD expression");
-  }
-  return makeParserResult<Expr>(result);
-}
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// parseQualifiedDeclName
-///
-///   qualified-decl-name:
-///     type-identifier? unqualified-decl-name
-///   type-identifier:
-///     identifier generic-args? ('.' identifier generic-args?)*
-///
-/// Parses an optional base type, followed by a declaration name.
-/// Returns true on error (if function decl name could not be parsed).
-static bool parseQualifiedDeclName(Parser &P, Diag<> nameParseError,
-                                   TypeRepr *&baseType, DeclName &name,
-                                   DeclNameLoc &nameLoc) {
-  // If the current token is an identifier or `Self` or `Any`, then attempt to
-  // parse the base type. Otherwise, base type is null.
-  bool canParseBaseType = false;
-  {
-    Parser::BacktrackingScope backtrack(P);
-    canParseBaseType = P.canParseTypeIdentifier();
-  }
-  if (canParseBaseType)
-    baseType =
-      P.parseTypeIdentifier(/*isParsingQualifiedDeclName*/ true).getPtrOrNull();
-  else
-    baseType = nullptr;
-
-  // If base type was parsed and has at least one component, then there was a
-  // dot before the current token.
-  bool afterDot = false;
-  if (baseType) {
-    if (auto ident = dyn_cast<IdentTypeRepr>(baseType)) {
-      auto components = ident->getComponentRange();
-      afterDot = std::distance(components.begin(), components.end()) > 0;
-    }
-  }
-  name = P.parseUnqualifiedDeclName(afterDot, nameLoc, nameParseError,
-                                    /*allowOperators*/ true,
-                                    /*allowZeroArgCompoundNames*/ true);
-  // The base type is optional, but the final unqualified decl name is not.
-  // If name could not be parsed, return true for error.
-  if (!name) return true;
-  return false;
-}
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// parseExprAdjoint
-///   expr-adjoint: '#adjoint' '(' qualified-decl-name ')'
-ParserResult<Expr> Parser::parseExprAdjoint() {
-  SyntaxParsingContext AdjointContext(SyntaxContext, SyntaxKind::AdjointExpr);
-
-  SourceLoc poundLoc = consumeToken(tok::pound_adjoint);
-  SourceLoc lParenLoc, rParenLoc;
-
-  auto errorAndSkipToEnd = [&]() -> ParserResult<Expr> {
-    skipUntilDeclStmtRBrace(tok::r_paren);
-    rParenLoc = Tok.is(tok::r_paren) ? consumeToken() : PreviousLoc;
-    return makeParserResult<Expr>(new (Context)
-                                  ErrorExpr(SourceRange(poundLoc, rParenLoc)));
-  };
-
-  if (parseToken(tok::l_paren, lParenLoc, diag::expr_expected_lparen,
-                 "#adjoint"))
-    return errorAndSkipToEnd();
-  // Parse original function.
-  TypeRepr *baseType;
-  DeclName originalName;
-  DeclNameLoc originalNameLoc;
-  if (parseQualifiedDeclName(*this, diag::expr_adjoint_expected_function_name,
-                             baseType, originalName, originalNameLoc))
-    return errorAndSkipToEnd();
-  if (parseToken(tok::r_paren, rParenLoc, diag::expr_expected_rparen,
-                 "#adjoint"))
-    return errorAndSkipToEnd();
-  return makeParserResult<Expr>(
-    AdjointExpr::create(Context, poundLoc, lParenLoc, originalName,
-                        originalNameLoc, baseType, rParenLoc));
-}
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// expr-pound-assert:
-///   '#assert' '(' expr ',' string_literal ')'
-ParserResult<Expr> Parser::parseExprPoundAssert() {
-  SyntaxParsingContext AssertContext(SyntaxContext,
-      SyntaxKind::PoundAssertExpr);
-
-  SourceLoc startLoc = consumeToken(tok::pound_assert);
-  SourceLoc endLoc;
-
-  auto errorAndSkipToEnd = [&]() -> ParserResult<Expr> {
-    skipUntilDeclStmtRBrace(tok::r_paren);
-    if (Tok.is(tok::r_paren)) {
-      endLoc = consumeToken();
-    } else {
-      endLoc = PreviousLoc;
-    }
-    return makeParserResult<Expr>(new (Context)
-                                      ErrorExpr(SourceRange(startLoc, endLoc)));
-  };
-
-  if (parseToken(tok::l_paren, diag::pound_assert_expected, "(")) {
-    return errorAndSkipToEnd();
-  }
-
-  auto conditionExprResult = parseExpr(diag::pound_assert_expected_expression);
-  if (conditionExprResult.isParseError()) {
-    return errorAndSkipToEnd();
-  }
-
-  StringRef message = "assertion failed";
-  if (consumeIf(tok::comma)) {
-    if (Tok.isNot(tok::string_literal)) {
-      diagnose(Tok.getLoc(), diag::pound_assert_expected_string_literal);
-      return errorAndSkipToEnd();
-    }
-
-    auto *messageExpr = parseExprStringLiteral().get();
-    if (messageExpr->getKind() == ExprKind::InterpolatedStringLiteral) {
-      diagnose(messageExpr->getStartLoc(),
-               diag::pound_assert_string_interpolation)
-          .highlight(messageExpr->getSourceRange());
-      return errorAndSkipToEnd();
-    }
-
-    message = cast<StringLiteralExpr>(messageExpr)->getValue();
-  }
-
-  if (parseToken(tok::r_paren, endLoc, diag::pound_assert_expected, ")")) {
-    return errorAndSkipToEnd();
-  }
-
-  return makeParserResult<Expr>(new (Context) PoundAssertExpr(
-      startLoc, endLoc, conditionExprResult.get(), message));
 }

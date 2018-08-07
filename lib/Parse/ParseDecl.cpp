@@ -319,7 +319,7 @@ ParserResult<AvailableAttr> Parser::parseExtendedAvailabilitySpecList(
   StringRef Platform = Tok.getText();
 
   StringRef Message, Renamed;
-  clang::VersionTuple Introduced, Deprecated, Obsoleted;
+  llvm::VersionTuple Introduced, Deprecated, Obsoleted;
   SourceRange IntroducedRange, DeprecatedRange, ObsoletedRange;
   auto PlatformAgnostic = PlatformAgnosticAvailabilityKind::None;
 
@@ -1497,7 +1497,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
 
       for (auto *Spec : Specs) {
         PlatformKind Platform;
-        clang::VersionTuple Version;
+        llvm::VersionTuple Version;
         SourceRange VersionRange;
         PlatformAgnosticAvailabilityKind PlatformAgnostic;
 
@@ -1527,9 +1527,9 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
                                      /*Rename=*/StringRef(),
                                      /*Introduced=*/Version,
                                      /*IntroducedRange=*/VersionRange,
-                                     /*Deprecated=*/clang::VersionTuple(),
+                                     /*Deprecated=*/llvm::VersionTuple(),
                                      /*DeprecatedRange=*/SourceRange(),
-                                     /*Obsoleted=*/clang::VersionTuple(),
+                                     /*Obsoleted=*/llvm::VersionTuple(),
                                      /*ObsoletedRange=*/SourceRange(),
                                      PlatformAgnostic,
                                      /*Implicit=*/false));
@@ -1658,7 +1658,7 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
   return false;
 }
 
-bool Parser::parseVersionTuple(clang::VersionTuple &Version,
+bool Parser::parseVersionTuple(llvm::VersionTuple &Version,
                                SourceRange &Range,
                                const Diagnostic &D) {
   SyntaxParsingContext VersionContext(SyntaxContext, SyntaxKind::VersionTuple);
@@ -1679,7 +1679,7 @@ bool Parser::parseVersionTuple(clang::VersionTuple &Version,
       consumeToken();
       return true;
     }
-    Version = clang::VersionTuple(major);
+    Version = llvm::VersionTuple(major);
     Range = SourceRange(StartLoc, Tok.getLoc());
     consumeToken();
     return false;
@@ -1713,9 +1713,9 @@ bool Parser::parseVersionTuple(clang::VersionTuple &Version,
     Range = SourceRange(StartLoc, Tok.getLoc());
     consumeToken();
     
-    Version = clang::VersionTuple(major, minor, micro);
+    Version = llvm::VersionTuple(major, minor, micro);
   } else {
-    Version = clang::VersionTuple(major, minor);
+    Version = llvm::VersionTuple(major, minor);
   }
 
   return false;
@@ -2043,9 +2043,7 @@ bool Parser::parseTypeAttribute(TypeAttributes &Attributes, bool justChecking) {
       if (Attributes.has(TAK_noescape)) {
         diagnose(Loc, diag::attr_noescape_conflicts_escaping_autoclosure);
       } else {
-        diagnose(Loc, Context.isSwiftVersion3()
-                          ? diag::swift3_attr_autoclosure_escaping_deprecated
-                          : diag::attr_autoclosure_escaping_deprecated)
+        diagnose(Loc, diag::attr_autoclosure_escaping_deprecated)
             .fixItReplace(autoclosureEscapingParenRange, " @escaping ");
       }
       Attributes.setAttr(TAK_escaping, Loc);
@@ -2070,9 +2068,7 @@ bool Parser::parseTypeAttribute(TypeAttributes &Attributes, bool justChecking) {
     // In SIL, the polarity of @escaping is reversed.
     // @escaping is the default and @noescape is explicit.
     if (!isInSILMode()) {
-      diagnose(Loc, Context.isSwiftVersion3()
-               ? diag::swift3_attr_noescape_deprecated
-               : diag::attr_noescape_deprecated)
+      diagnose(Loc, diag::attr_noescape_deprecated)
         .fixItRemove({Attributes.AtLoc, Loc});
     }
     break;
@@ -4017,12 +4013,14 @@ static AccessorDecl *createAccessorFunc(SourceLoc DeclLoc,
   switch (Kind) {
   case AccessorKind::Address:
   case AccessorKind::Get:
+  case AccessorKind::Read:
     break;
 
   case AccessorKind::MutableAddress:
   case AccessorKind::Set:
   case AccessorKind::WillSet:
   case AccessorKind::DidSet:
+  case AccessorKind::Modify:
     if (D->isInstanceMember())
       D->setSelfAccessKind(SelfAccessKind::Mutating);
     break;
@@ -4187,6 +4185,10 @@ static StringRef getAccessorNameForDiagnostic(AccessorKind accessorKind,
     return article ? "an addressor" : "addressor";
   case AccessorKind::MutableAddress:
     return article ? "a mutable addressor" : "mutable addressor";
+  case AccessorKind::Read:
+    return article ? "a 'read' accessor" : "'read' accessor";
+  case AccessorKind::Modify:
+    return article ? "a 'modify' accessor" : "'modify' accessor";
   case AccessorKind::WillSet:
     return "'willSet'";
   case AccessorKind::DidSet:
@@ -4247,6 +4249,8 @@ static bool isAllowedInLimitedSyntax(AccessorKind kind) {
   case AccessorKind::MaterializeForSet:
   case AccessorKind::WillSet:
   case AccessorKind::DidSet:
+  case AccessorKind::Read:
+  case AccessorKind::Modify:
     return false;
   }
   llvm_unreachable("bad accessor kind");
@@ -4288,6 +4292,7 @@ struct Parser::ParsedAccessors {
   /// Find the first accessor that can be used to perform mutation.
   AccessorDecl *findFirstMutator() const {
     if (Set) return Set;
+    if (Modify) return Modify;
     if (MutableAddress) return MutableAddress;
     return nullptr;
   }
@@ -4601,6 +4606,8 @@ static void fillInAccessorTypeErrors(Parser &P, FuncDecl *accessor,
   case AccessorKind::Set:
   case AccessorKind::WillSet:
   case AccessorKind::DidSet:
+  case AccessorKind::Read:
+  case AccessorKind::Modify:
     return;
   }
   llvm_unreachable("bad kind");
@@ -4906,11 +4913,15 @@ Parser::ParsedAccessors::classify(Parser &P, AbstractStorageDecl *storage,
   // Okay, observers are out of the way.
   assert(!WillSet && !DidSet);
 
-  // 'get' and a non-mutable addressor are exclusive.
+  // 'get', 'read', and a non-mutable addressor are all exclusive.
   ReadImplKind readImpl;
   if (Get) {
+    diagnoseConflictingAccessors(P, Get, Read);
     diagnoseConflictingAccessors(P, Get, Address);
     readImpl = ReadImplKind::Get;
+  } else if (Read) {
+    diagnoseConflictingAccessors(P, Read, Address);
+    readImpl = ReadImplKind::Read;
   } else if (Address) {
     readImpl = ReadImplKind::Address;
 
@@ -4921,7 +4932,7 @@ Parser::ParsedAccessors::classify(Parser &P, AbstractStorageDecl *storage,
       P.diagnose(mutator->getLoc(),
                  // Don't mention the more advanced accessors if the user
                  // only provided a setter without a getter.
-                 MutableAddress
+                 (MutableAddress || Modify)
                    ? diag::missing_reading_accessor
                    : diag::missing_getter,
                  isa<SubscriptDecl>(storage),
@@ -4945,14 +4956,23 @@ Parser::ParsedAccessors::classify(Parser &P, AbstractStorageDecl *storage,
     readImpl = ReadImplKind::Stored;
   }
 
-  // A mutable addressor is exclusive with 'set'.
-  // Prefer using 'set' over a mutable addressor.
+  // A mutable addressor is exclusive with 'set' and 'modify', but
+  // 'set' and 'modify' can appear together.
+  // Prefer using 'set' and 'modify' over a mutable addressor.
   WriteImplKind writeImpl;
   ReadWriteImplKind readWriteImpl;
   if (Set) {
     diagnoseConflictingAccessors(P, Set, MutableAddress);
     writeImpl = WriteImplKind::Set;
-    readWriteImpl = ReadWriteImplKind::MaterializeToTemporary;
+    if (Modify) {
+      readWriteImpl = ReadWriteImplKind::Modify;
+    } else {
+      readWriteImpl = ReadWriteImplKind::MaterializeToTemporary;
+    }
+  } else if (Modify) {
+    diagnoseConflictingAccessors(P, Modify, MutableAddress);
+    writeImpl = WriteImplKind::Modify;
+    readWriteImpl = ReadWriteImplKind::Modify;
   } else if (MutableAddress) {
     writeImpl = WriteImplKind::MutableAddress;
     readWriteImpl = ReadWriteImplKind::MutableAddress;
@@ -5423,10 +5443,7 @@ Parser::parseDeclFunc(SourceLoc StaticLoc, StaticSpellingKind StaticSpelling,
     if (Flags & PD_InProtocol) {
       switch (StaticSpelling) {
       case StaticSpellingKind::None: {
-        auto Message = Context.isSwiftVersion3()
-                           ? diag::swift3_operator_static_in_protocol
-                           : diag::operator_static_in_protocol;
-        diagnose(NameLoc, Message, SimpleName.str())
+        diagnose(NameLoc, diag::operator_static_in_protocol, SimpleName.str())
             .fixItInsert(FuncLoc, "static ");
         StaticSpelling = StaticSpellingKind::KeywordStatic;
         break;
@@ -6658,15 +6675,9 @@ Parser::parseDeclOperatorImpl(SourceLoc OperatorLoc, Identifier Name,
   SourceLoc lBraceLoc;
   if (consumeIf(tok::l_brace, lBraceLoc)) {
     if (isInfix && !Tok.is(tok::r_brace)) {
-      auto message = Context.isSwiftVersion3()
-                         ? diag::swift3_deprecated_operator_body_use_group
-                         : diag::deprecated_operator_body_use_group;
-      diagnose(lBraceLoc, message);
+      diagnose(lBraceLoc, diag::deprecated_operator_body_use_group);
     } else {
-      auto message = Context.isSwiftVersion3()
-                         ? diag::swift3_deprecated_operator_body
-                         : diag::deprecated_operator_body;
-      auto Diag = diagnose(lBraceLoc, message);
+      auto Diag = diagnose(lBraceLoc, diag::deprecated_operator_body);
       if (Tok.is(tok::r_brace)) {
         SourceLoc lastGoodLoc = precedenceGroupNameLoc;
         if (lastGoodLoc.isInvalid())

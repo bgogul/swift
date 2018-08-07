@@ -21,8 +21,6 @@
 #include "swift/Basic/QuotedString.h"
 #include "swift/SIL/SILPrintContext.h"
 #include "swift/SIL/CFG.h"
-// SWIFT_ENABLE_TENSORFLOW
-#include "swift/SIL/SILConstants.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILCoverageMap.h"
 #include "swift/SIL/SILDebugScope.h"
@@ -194,34 +192,8 @@ static void printFullContext(const DeclContext *Context, raw_ostream &Buffer) {
   }
 
   case DeclContextKind::ExtensionDecl: {
-    Type Ty = cast<ExtensionDecl>(Context)->getExtendedType();
-    TypeBase *Base = Ty->getCanonicalType().getPointer();
-    const NominalTypeDecl *ExtNominal = nullptr;
-    switch (Base->getKind()) {
-      default:
-        llvm_unreachable("unhandled context kind in SILPrint!");
-      case TypeKind::Protocol:
-        ExtNominal = cast<ProtocolType>(Base)->getDecl();
-        break;
-      case TypeKind::Enum:
-        ExtNominal = cast<EnumType>(Base)->getDecl();
-        break;
-      case TypeKind::Struct:
-        ExtNominal = cast<StructType>(Base)->getDecl();
-        break;
-      case TypeKind::Class:
-        ExtNominal = cast<ClassType>(Base)->getDecl();
-        break;
-      case TypeKind::BoundGenericEnum:
-        ExtNominal = cast<BoundGenericEnumType>(Base)->getDecl();
-        break;
-      case TypeKind::BoundGenericStruct:
-        ExtNominal = cast<BoundGenericStructType>(Base)->getDecl();
-        break;
-      case TypeKind::BoundGenericClass:
-        ExtNominal = cast<BoundGenericClassType>(Base)->getDecl();
-        break;
-    }
+    const NominalTypeDecl *ExtNominal =
+      cast<ExtensionDecl>(Context)->getExtendedNominal();
     printFullContext(ExtNominal->getDeclContext(), Buffer);
     Buffer << ExtNominal->getName() << ".";
     return;
@@ -313,6 +285,14 @@ void SILDeclRef::print(raw_ostream &OS) const {
       case AccessorKind::MutableAddress:
         printValueDecl(accessor->getStorage(), OS);
         OS << "!mutableAddressor";
+        break;
+      case AccessorKind::Read:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!read";
+        break;
+      case AccessorKind::Modify:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!modify";
         break;
       }
     }
@@ -583,8 +563,7 @@ public:
 
     // If SIL ownership is enabled and the given function has not had ownership
     // stripped out, print out ownership of SILArguments.
-    if (BB->getModule().getOptions().EnableSILOwnership &&
-        BB->getParent()->hasQualifiedOwnership()) {
+    if (BB->getParent()->hasQualifiedOwnership()) {
       *this << getIDAndTypeAndOwnership(Args[0]);
       for (SILArgument *Arg : Args.drop_front()) {
         *this << ", " << getIDAndTypeAndOwnership(Arg);
@@ -1149,29 +1128,6 @@ public:
     *this << Ctx.getID(AI->getOperand());
   }
 
-  /// SWIFT_ENABLE_TENSORFLOW
-  void visitGradientInst(GradientInst *GI) {
-    auto &indices = GI->getIndices();
-    *this << "[source " << indices.source << "] ";
-    if (!indices.parameters.empty()) {
-      *this << "[wrt ";
-      interleave(indices.parameters.set_bits(), [&](unsigned idx) {
-        *this << idx;
-      }, [&]{
-        *this << ", ";
-      });
-      *this << "] ";
-    }
-    auto options = GI->getOptions();
-    if (options.contains(SILGradientFlags::Seedable))
-      *this << "[seedable] ";
-    if (options.contains(SILGradientFlags::PreservingResult))
-      *this << "[preserving_result] ";
-    if (options.contains(SILGradientFlags::Delayed))
-      *this << "[delayed] ";
-    *this << getIDAndType(GI->getOriginal());
-  }
-
   void visitFunctionRefInst(FunctionRefInst *FRI) {
     FRI->getReferencedFunction()->printName(PrintState.OS);
     *this << " : " << FRI->getType();
@@ -1190,111 +1146,6 @@ public:
     
     *this << ") : ";
     *this << BI->getType();
-  }
-
-  // SWIFT_ENABLE_TENSORFLOW
-  void visitSymbolicValue(SymbolicValue v) {
-    switch (v.getKind()) {
-    case SymbolicValue::Integer: {
-      APInt intValue = v.getIntegerValue();
-      *this << "i" << intValue.getBitWidth() << " " << intValue;
-      return;
-    }
-    case SymbolicValue::Float: {
-      APFloat floatValue = v.getFloatValue();
-      *this << "f" << APFloat::getSizeInBits(floatValue.getSemantics()) << " ";
-
-      APInt bits = floatValue.bitcastToAPInt();
-      *this << "0x" << bits.toString(16, /*Signed*/ false);
-      *this << " ";
-
-      SmallString<12> decimal;
-      floatValue.toString(decimal);
-      *this << "/* " << decimal << " */";
-      return;
-    }
-    case SymbolicValue::String:
-      *this << QuotedString(v.getStringValue());
-      return;
-    case SymbolicValue::Metatype:
-      *this << SILType::getPrimitiveObjectType(v.getMetatypeValue());
-      return;
-    case SymbolicValue::Function: {
-      auto function = v.getFunctionValue();
-      *this << "@" << function->getName();
-      *this << " : $" << function->getLoweredFunctionType();
-      return;
-    }
-    case SymbolicValue::Aggregate: {
-      *this << '(';
-      interleave(v.getAggregateValue(), [&](SymbolicValue element) {
-        visitSymbolicValue(element);
-      }, [&] {
-        *this << ", ";
-      });
-      *this << ')';
-      return;
-    }
-    case SymbolicValue::Enum:
-      *this << SILDeclRef(v.getEnumValue(), SILDeclRef::Kind::EnumElement);
-      return;
-    case SymbolicValue::EnumWithPayload:
-      *this << '(';
-      *this << SILDeclRef(v.getEnumValue(), SILDeclRef::Kind::EnumElement);
-      *this << ", ";
-      visitSymbolicValue(v.getEnumPayloadValue());
-      *this << ')';
-      return;
-    case SymbolicValue::Array: {
-      CanType elementType;
-      auto elements = v.getArrayValue(elementType);
-
-      *this << "[$" << elementType << ": ";
-      interleave(elements, [&](SymbolicValue element) {
-        visitSymbolicValue(element);
-      }, [&] {
-        *this << ", ";
-      });
-      *this << ']';
-      return;
-    }
-    case SymbolicValue::UninitMemory:
-    case SymbolicValue::Unknown:
-    case SymbolicValue::Address:
-      llvm_unreachable("Unimplemented SymbolicValue case");
-    }
-  }
-
-  // SWIFT_ENABLE_TENSORFLOW
-  void visitGraphOperationInst(GraphOperationInst *GI) {
-    *this << QuotedString(GI->getName().str());
-
-    *this << "(";
-    interleave(GI->getArguments(), [&](SILValue v) {
-      *this << getIDAndType(v);
-    }, [&] {
-      *this << ", ";
-    });
-    *this << ")";
-
-    if (GI->getNumAttributes()) {
-      *this << " {";
-      interleave(GI->getAttributes(), [&](GraphOperationAttribute attr) {
-        *this << attr.name.str();
-        *this << ": ";
-        visitSymbolicValue(attr.value);
-      }, [&] {
-        *this << ", ";
-      });
-      *this << "}";
-    }
-
-    *this << " : ";
-    interleave(GI->getResultTypes(), [&](SILType type) {
-      *this << type;
-    }, [&] {
-      *this << ", ";
-    });
   }
   
   void visitAllocGlobalInst(AllocGlobalInst *AGI) {
@@ -1333,7 +1184,6 @@ public:
   }
   static StringRef getStringEncodingName(StringLiteralInst::Encoding kind) {
     switch (kind) {
-    // SWIFT_ENABLE_TENSORFLOW
     case StringLiteralInst::Encoding::Bytes: return "bytes ";
     case StringLiteralInst::Encoding::UTF8: return "utf8 ";
     case StringLiteralInst::Encoding::UTF16: return "utf16 ";
@@ -1345,7 +1195,6 @@ public:
   void visitStringLiteralInst(StringLiteralInst *SLI) {
     *this << getStringEncodingName(SLI->getEncoding());
 
-    // SWIFT_ENABLE_TENSORFLOW
     if (SLI->getEncoding() != StringLiteralInst::Encoding::Bytes) {
       // FIXME: this isn't correct: this doesn't properly handle translating
       // UTF16 into UTF8, and the SIL parser always parses as UTF8.
@@ -2485,11 +2334,6 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
     OS << "[_specialize "; Attr->print(OS); OS << "] ";
   }
 
-  // SWIFT_ENABLE_TENSORFLOW
-  for (auto *Attr : getReverseDifferentiableAttrs()) {
-    OS << "[reverse_differentiable "; Attr->print(OS); OS << "] ";
-  }
-
   // TODO: Handle clang node owners which don't have a name.
   if (hasClangNode() && getClangNodeOwner()->hasName()) {
     OS << "[clang ";
@@ -2834,7 +2678,6 @@ void SILModule::print(SILPrintContext &PrintCtx, ModuleDecl *M,
     for (const Decl *D : topLevelDecls) {
       if (!WholeModuleMode && !(D->getDeclContext() == AssociatedDeclContext))
           continue;
-      // SWIFT_ENABLE_TENSORFLOW
       if ((isa<ValueDecl>(D) || isa<OperatorDecl>(D) ||
            isa<ExtensionDecl>(D) || isa<ImportDecl>(D)) &&
           !D->isImplicit()) {
@@ -3176,17 +3019,6 @@ void SILSpecializeAttr::print(llvm::raw_ostream &OS) const {
                },
                [&] { OS << ", "; });
   }
-}
-
-/// SWIFT_ENABLE_TENSORFLOW
-void SILReverseDifferentiableAttr::print(llvm::raw_ostream &OS) const {
-  auto &indices = getIndices();
-  OS << "source " << indices.source << " wrt ";
-  interleave(indices.parameters.set_bits(),
-             [&](unsigned index) { OS << index; },
-             [&] { OS << ", "; });
-  if (!PrimalName.empty()) OS << " primal @" << PrimalName;
-  if (!AdjointName.empty()) OS << " adjoint @" << AdjointName;
 }
 
 //===----------------------------------------------------------------------===//

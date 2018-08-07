@@ -459,8 +459,7 @@ public:
   }
 
   SourceLoc consumeIdentifier(Identifier *Result = nullptr) {
-    assert(Tok.isAny(tok::identifier, tok::kw_self, tok::kw_Self,
-                     /* for Swift3 */tok::kw_throws, tok::kw_rethrows));
+    assert(Tok.isAny(tok::identifier, tok::kw_self, tok::kw_Self));
     if (Result)
       *Result = Context.getIdentifier(Tok.getText());
     return consumeToken();
@@ -499,6 +498,12 @@ public:
   bool consumeIfNotAtStartOfLine(tok K) {
     if (Tok.isAtStartOfLine()) return false;
     return consumeIf(K);
+  }
+
+  bool isContextualYieldKeyword() {
+    return (Tok.isContextualKeyword("yield") &&
+            isa<AccessorDecl>(CurDeclContext) &&
+            cast<AccessorDecl>(CurDeclContext)->isCoroutine());
   }
   
   /// \brief Read tokens until we get to one of the specified tokens, then
@@ -845,7 +850,7 @@ public:
 
   /// Parse a version tuple of the form x[.y[.z]]. Returns true if there was
   /// an error parsing.
-  bool parseVersionTuple(clang::VersionTuple &Version, SourceRange &Range,
+  bool parseVersionTuple(llvm::VersionTuple &Version, SourceRange &Range,
                          const Diagnostic &D);
 
   bool parseTypeAttributeList(VarDecl::Specifier &Specifier,
@@ -1357,6 +1362,7 @@ public:
   ParserResult<Stmt> parseStmtBreak();
   ParserResult<Stmt> parseStmtContinue();
   ParserResult<Stmt> parseStmtReturn(SourceLoc tryLoc);
+  ParserResult<Stmt> parseStmtYield(SourceLoc tryLoc);
   ParserResult<Stmt> parseStmtThrow(SourceLoc tryLoc);
   ParserResult<Stmt> parseStmtDefer();
   ParserStatus

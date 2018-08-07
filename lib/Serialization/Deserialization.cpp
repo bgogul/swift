@@ -1330,9 +1330,9 @@ ModuleFile::resolveCrossReference(ModuleDecl *baseModule, uint32_t pathLen) {
       baseModule->lookupMember(values, baseModule, name,
                                getIdentifier(privateDiscriminator));
     } else {
-      baseModule->lookupQualified(ModuleType::get(baseModule), name,
+      baseModule->lookupQualified(baseModule, name,
                                   NL_QualifiedDefault | NL_KnownNoDependency,
-                                  /*typeResolver=*/nullptr, values);
+                                  values);
     }
     filterValues(filterTy, nullptr, nullptr, isType, inProtocolExt,
                  importedFromClang, isStatic, None, values);
@@ -2133,6 +2133,7 @@ getActualReadImplKind(unsigned rawKind) {
   CASE(Get)
   CASE(Inherited)
   CASE(Address)
+  CASE(Read)
 #undef CASE
   }
   return None;
@@ -2150,6 +2151,7 @@ getActualWriteImplKind(unsigned rawKind) {
   CASE(StoredWithObservers)
   CASE(InheritedWithObservers)
   CASE(MutableAddress)
+  CASE(Modify)
 #undef CASE
   }
   return None;
@@ -2166,6 +2168,7 @@ getActualReadWriteImplKind(unsigned rawKind) {
   CASE(MaterializeForSet)
   CASE(MutableAddress)
   CASE(MaterializeToTemporary)
+  CASE(Modify)
 #undef CASE
   }
   return None;
@@ -2434,11 +2437,11 @@ ModuleFile::getDeclCheckedImpl(DeclID DID, Optional<DeclContext *> ForcedContext
 #define DECODE_VER_TUPLE(X)\
   if (X##_HasMinor) {\
     if (X##_HasSubminor)\
-      X = clang::VersionTuple(X##_Major, X##_Minor, X##_Subminor);\
+      X = llvm::VersionTuple(X##_Major, X##_Minor, X##_Subminor);\
     else\
-      X = clang::VersionTuple(X##_Major, X##_Minor);\
+      X = llvm::VersionTuple(X##_Major, X##_Minor);\
     }\
-  else X = clang::VersionTuple(X##_Major);
+  else X = llvm::VersionTuple(X##_Major);
 
         bool isImplicit;
         bool isUnavailable;
@@ -2458,7 +2461,7 @@ ModuleFile::getDeclCheckedImpl(DeclID DID, Optional<DeclContext *> ForcedContext
         StringRef message = blobData.substr(0, messageSize);
         blobData = blobData.substr(messageSize);
         StringRef rename = blobData.substr(0, renameSize);
-        clang::VersionTuple Introduced, Deprecated, Obsoleted;
+        llvm::VersionTuple Introduced, Deprecated, Obsoleted;
         DECODE_VER_TUPLE(Introduced)
         DECODE_VER_TUPLE(Deprecated)
         DECODE_VER_TUPLE(Obsoleted)

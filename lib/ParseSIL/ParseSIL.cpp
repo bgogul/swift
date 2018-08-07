@@ -10,9 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SILParserFunctionBuilder.h"
 #include "swift/AST/ASTWalker.h"
-/// SWIFT_ENABLE_TENSORFLOW
-#include "swift/AST/AutoDiff.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
@@ -27,8 +26,6 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
-/// SWIFT_ENABLE_TENSORFLOW
-#include "swift/SIL/SILConstants.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
@@ -520,89 +517,78 @@ bool SILParser::diagnoseProblems() {
 
 /// getGlobalNameForDefinition - Given a definition of a global name, look
 /// it up and return an appropriate SIL function.
-SILFunction *SILParser::getGlobalNameForDefinition(Identifier Name,
-                                                   CanSILFunctionType Ty,
-                                                   SourceLoc Loc) {
+SILFunction *SILParser::getGlobalNameForDefinition(Identifier name,
+                                                   CanSILFunctionType ty,
+                                                   SourceLoc sourceLoc) {
+  SILParserFunctionBuilder builder(SILMod);
+  auto silLoc = RegularLocation(sourceLoc);
+
   // Check to see if a function of this name has been forward referenced.  If so
   // complete the forward reference.
-  auto It = TUState.ForwardRefFns.find(Name);
-  if (It != TUState.ForwardRefFns.end()) {
-    SILFunction *Fn = It->second.first;
-    
+  auto iter = TUState.ForwardRefFns.find(name);
+  if (iter != TUState.ForwardRefFns.end()) {
+    SILFunction *fn = iter->second.first;
+
     // Verify that the types match up.
-    if (Fn->getLoweredFunctionType() != Ty) {
-      P.diagnose(Loc, diag::sil_value_use_type_mismatch, Name.str(),
-                 Fn->getLoweredFunctionType(), Ty);
-      P.diagnose(It->second.second, diag::sil_prior_reference);
-      auto loc = RegularLocation(Loc);
-      Fn =
-          SILMod.createFunction(SILLinkage::Private, "", Ty, nullptr, loc,
-                                IsNotBare, IsNotTransparent, IsNotSerialized);
-      Fn->setDebugScope(new (SILMod) SILDebugScope(loc, Fn));
+    if (fn->getLoweredFunctionType() != ty) {
+      P.diagnose(sourceLoc, diag::sil_value_use_type_mismatch, name.str(),
+                 fn->getLoweredFunctionType(), ty);
+      P.diagnose(iter->second.second, diag::sil_prior_reference);
+      fn = builder.createFunctionForForwardReference("" /*name*/, ty, silLoc);
     }
-    
-    assert(Fn->isExternalDeclaration() && "Forward defns cannot have bodies!");
-    TUState.ForwardRefFns.erase(It);
+
+    assert(fn->isExternalDeclaration() && "Forward defns cannot have bodies!");
+    TUState.ForwardRefFns.erase(iter);
 
     // Move the function to this position in the module.
-    SILMod.getFunctionList().remove(Fn);
-    SILMod.getFunctionList().push_back(Fn);
+    //
+    // FIXME: Should we move this functionality into SILParserFunctionBuilder?
+    SILMod.getFunctionList().remove(fn);
+    SILMod.getFunctionList().push_back(fn);
 
-    return Fn;
-  }
-  
-  auto loc = RegularLocation(Loc);
-  // If we don't have a forward reference, make sure the function hasn't been
-  // defined already.
-  if (SILMod.lookUpFunction(Name.str()) != nullptr) {
-    P.diagnose(Loc, diag::sil_value_redefinition, Name.str());
-    auto *fn =
-        SILMod.createFunction(SILLinkage::Private, "", Ty, nullptr, loc,
-                              IsNotBare, IsNotTransparent, IsNotSerialized);
-    fn->setDebugScope(new (SILMod) SILDebugScope(loc, fn));
     return fn;
   }
 
+  // If we don't have a forward reference, make sure the function hasn't been
+  // defined already.
+  if (SILMod.lookUpFunction(name.str()) != nullptr) {
+    P.diagnose(sourceLoc, diag::sil_value_redefinition, name.str());
+    return builder.createFunctionForForwardReference("" /*name*/, ty, silLoc);
+  }
+
   // Otherwise, this definition is the first use of this name.
-  auto *fn = SILMod.createFunction(SILLinkage::Private, Name.str(), Ty,
-                                   nullptr, loc, IsNotBare,
-                                   IsNotTransparent, IsNotSerialized);
-  fn->setDebugScope(new (SILMod) SILDebugScope(loc, fn));
-  return fn;
+  return builder.createFunctionForForwardReference(name.str(), ty, silLoc);
 }
-
-
 
 /// getGlobalNameForReference - Given a reference to a global name, look it
 /// up and return an appropriate SIL function.
-SILFunction *SILParser::getGlobalNameForReference(Identifier Name,
-                                                  CanSILFunctionType Ty,
-                                                  SourceLoc Loc,
-                                                  bool IgnoreFwdRef) {
-  auto loc = RegularLocation(Loc);
-  
+SILFunction *SILParser::getGlobalNameForReference(Identifier name,
+                                                  CanSILFunctionType funcTy,
+                                                  SourceLoc sourceLoc,
+                                                  bool ignoreFwdRef) {
+  SILParserFunctionBuilder builder(SILMod);
+  auto silLoc = RegularLocation(sourceLoc);
+
   // Check to see if we have a function by this name already.
-  if (SILFunction *FnRef = SILMod.lookUpFunction(Name.str())) {
+  if (SILFunction *fn = SILMod.lookUpFunction(name.str())) {
     // If so, check for matching types.
-    if (FnRef->getLoweredFunctionType() != Ty) {
-      P.diagnose(Loc, diag::sil_value_use_type_mismatch,
-                 Name.str(), FnRef->getLoweredFunctionType(), Ty);
-      FnRef =
-          SILMod.createFunction(SILLinkage::Private, "", Ty, nullptr, loc,
-                                IsNotBare, IsNotTransparent, IsNotSerialized);
-      FnRef->setDebugScope(new (SILMod) SILDebugScope(loc, FnRef));
+    if (fn->getLoweredFunctionType() == funcTy) {
+      return fn;
     }
-    return FnRef;
+
+    P.diagnose(sourceLoc, diag::sil_value_use_type_mismatch, name.str(),
+               fn->getLoweredFunctionType(), funcTy);
+
+    return builder.createFunctionForForwardReference("" /*name*/, funcTy,
+                                                     silLoc);
   }
   
   // If we didn't find a function, create a new one - it must be a forward
   // reference.
-  auto *Fn = SILMod.createFunction(SILLinkage::Private, Name.str(), Ty,
-                                   nullptr, loc, IsNotBare,
-                                   IsNotTransparent, IsNotSerialized);
-  Fn->setDebugScope(new (SILMod) SILDebugScope(loc, Fn));
-  TUState.ForwardRefFns[Name] = { Fn, IgnoreFwdRef ? SourceLoc() : Loc };
-  return Fn;
+  auto *fn =
+      builder.createFunctionForForwardReference(name.str(), funcTy, silLoc);
+  TUState.ForwardRefFns[name] = {fn, ignoreFwdRef ? SourceLoc() : sourceLoc};
+  return fn;
 }
 
 
@@ -893,266 +879,6 @@ void SILParser::convertRequirements(SILFunction *F,
   }
 }
 
-// SWIFT_ENABLE_TENSORFLOW
-/// Parse a SIL constant value (one of the following categories):
-/// - An integer datatype and literal (i32 42).
-/// - A floating point datatype and literal (f64 3.14).
-///   - The literal value may be in either decimal format or the hexadecimal
-///     format used by the 'float_literal' instruction.
-/// - A UTF-8 string literal ("foo").
-/// - A metatype (the instance type is parsed) ($Float).
-/// - An aggregate ((i32 1, i64 2, f32 3.0)).
-///   - Aggregates values represent constant structs/tuples.
-/// - A SIL function reference (@foo : $(Int) -> Int).
-/// Returns true on error.
-static bool parseSymbolicValue(SymbolicValue &value, SILParser &SP,
-                               SILBuilder &B) {
-  auto &P = SP.P;
-  auto &allocator = B.getModule().getASTContext().getAllocator();
-
-  if (P.Tok.is(tok::identifier)) {
-    // Bitwidth of the integer/floating point literal.
-    unsigned width;
-    // Handle integer literals.
-    if (P.Tok.getText().startswith("i")) {
-      // Parse integer datatype.
-      P.consumeStartingCharacterOfCurrentToken();
-      if (SP.parseInteger(width, diag::sil_const_expected_int_datatype))
-        return true;
-
-      // Parse integer value.
-      bool negative = false;
-      if (P.Tok.isAnyOperator() && P.Tok.getText() == "-") {
-        negative = true;
-        P.consumeToken();
-      }
-      APInt intValue(width, 0);
-      if (SP.parseInteger(intValue, diag::sil_const_expected_int_value))
-        return true;
-
-      // Negate and truncate value, if necessary.
-      if (negative)
-        intValue = -intValue;
-      if (intValue.getBitWidth() != width)
-        intValue = intValue.zextOrTrunc(width);
-
-      value = SymbolicValue::getInteger(intValue, allocator);
-      return false;
-    }
-    // Handle floating point literals.
-    if (P.Tok.getText().startswith("f")) {
-      // Parse floating point datatype.
-      auto datatypeToken = P.Tok;
-      P.consumeStartingCharacterOfCurrentToken();
-      if (SP.parseInteger(width, diag::sil_const_expected_fp_datatype))
-        return true;
-
-      // Parse floating point value.
-      // Handle hexadecimal case.
-      if (P.Tok.is(tok::integer_literal) && P.Tok.getText().startswith("0x")) {
-        APInt bits(width, 0);
-        P.Tok.getText().getAsInteger(0, bits);
-        P.consumeToken(tok::integer_literal);
-        if (bits.getBitWidth() != width)
-          bits = bits.zextOrTrunc(width);
-        switch (width) {
-          case 32: {
-            APFloat floatValue(APFloat::IEEEsingle(), bits);
-            value = SymbolicValue::getFloat(floatValue, allocator);
-            return false;
-          }
-          case 64: {
-            APFloat floatValue(APFloat::IEEEdouble(), bits);
-            value = SymbolicValue::getFloat(floatValue, allocator);
-            return false;
-          }
-          default:
-            P.diagnose(datatypeToken, diag::sil_const_expected_fp_datatype);
-            return true;
-        }
-      }
-      // Handle decimal case.
-      bool negative = false;
-      if (P.Tok.isAnyOperator() && P.Tok.getText() == "-") {
-        negative = true;
-        P.consumeToken();
-      }
-      if (!P.Tok.is(tok::floating_literal)) {
-        P.diagnose(P.Tok, diag::sil_const_expected_fp_value);
-        return true;
-      }
-      double tmpValue;
-      P.Tok.getText().getAsDouble(tmpValue);
-      P.consumeToken(tok::floating_literal);
-
-      APFloat floatValue((float) 0);
-      switch (width) {
-      case 32:
-        floatValue = APFloat((float) tmpValue);
-        break;
-      case 64:
-        floatValue = APFloat(tmpValue);
-        break;
-      default:
-        P.diagnose(datatypeToken, diag::sil_const_expected_fp_datatype);
-        return true;
-      }
-      if (negative)
-        floatValue.changeSign();
-      value = SymbolicValue::getFloat(floatValue, allocator);
-      return false;
-    }
-  }
-  // Handle string literals.
-  if (P.Tok.is(tok::string_literal)) {
-    StringRef rawString = P.Tok.getText().drop_front().drop_back();
-    value = SymbolicValue::getString(rawString, allocator);
-    P.consumeToken(tok::string_literal);
-    return false;
-  }
-  // Handle metatypes (the instance type is parsed).
-  if (P.Tok.is(tok::sil_dollar)) {
-    SILType temp;
-    if (SP.parseSILType(temp))
-      return true;
-    value = SymbolicValue::getMetatype(temp.getASTType());
-    return false;
-  }
-  // Handle SIL function references.
-  if (P.Tok.is(tok::at_sign)) {
-    SILFunction *func;
-    SILLocation funcLoc = RegularLocation(P.getEndOfPreviousLoc());
-    if (SP.parseSILFunctionRef(funcLoc, func))
-      return true;
-    value = SymbolicValue::getFunction(func);
-    return false;
-  }
-  // Handle aggregate literals.
-  if (P.Tok.is(tok::l_paren)) {
-    SourceLoc lParenLoc = P.consumeToken(tok::l_paren);
-    SourceLoc rParenLoc;
-
-    SmallVector<SymbolicValue, 8> elements;
-    ParserStatus status =
-      P.parseList(tok::r_paren, lParenLoc, rParenLoc,
-                  /*AllowSepAfterLast*/ false,
-                  diag::sil_const_aggregate_expected_rparen,
-                  SyntaxKind::Unknown, [&]() -> ParserStatus {
-      SymbolicValue element;
-      if (parseSymbolicValue(element, SP, B))
-        return makeParserError();
-      elements.push_back(element);
-      return makeParserSuccess();
-    });
-    if (status.isError())
-      return true;
-    value = SymbolicValue::getAggregate(elements, allocator);
-    return false;
-  }
-  // Handle array literals.
-  if (P.Tok.is(tok::l_square)) {
-    SourceLoc lSquareLoc = P.consumeToken(tok::l_square);
-    SILType elementType;
-    if (SP.parseSILType(elementType))
-      return true;
-
-    if (!P.consumeIf(tok::colon)) {
-      P.diagnose(P.Tok, diag::expected_sil_colon, "array elements");
-      return true;
-    }
-
-    SourceLoc rSquareLoc;
-
-    SmallVector<SymbolicValue, 8> elements;
-    ParserStatus status =
-      P.parseList(tok::r_square, lSquareLoc, rSquareLoc,
-                  /*AllowSepAfterLast*/ false,
-                  diag::sil_const_array_expected_rsquare,
-                  SyntaxKind::Unknown,
-                  [&]() -> ParserStatus {
-      SymbolicValue element;
-      if (parseSymbolicValue(element, SP, B))
-        return makeParserError();
-      elements.push_back(element);
-      return makeParserSuccess();
-    });
-    if (status.isError())
-      return true;
-    value = SymbolicValue::getArray(elements, elementType.getASTType(),
-                                    allocator);
-    return false;
-  }
-  P.diagnose(P.Tok, diag::sil_graph_op_expected_attr_value);
-  return true;
-};
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// Parse an adjoint attribute, e.g. `[differentiable wrt 0, 1 adjoint @other]`.
-/// Returns true on error.
-static bool parseReverseDifferentiableAttr(
-  SmallVectorImpl<SILReverseDifferentiableAttr *> &DAs, SILParser &SP) {
-  auto &P = SP.P;
-  SourceLoc LastLoc = P.getEndOfPreviousLoc();
-  // Parse 'source'.
-  unsigned SourceIndex;
-  if (P.parseSpecificIdentifier(
-        "source", diag::sil_attr_differentiable_expected_keyword, "source") ||
-      P.parseUnsignedInteger(SourceIndex, LastLoc,
-                             diag::sil_gradient_expected_source_index))
-    return true;
-  // Parse 'wrt'.
-  if (P.parseSpecificIdentifier(
-        "wrt", diag::sil_attr_differentiable_expected_keyword, "wrt"))
-    return true;
-  // Parse parameter index list.
-  SmallVector<unsigned, 8> ParamIndices;
-  // Function that parses an index into `ParamIndices`. Returns true on error.
-  auto parseParam = [&]() -> bool {
-    unsigned Index;
-    // TODO: Reject non-ascending parameter index lists.
-    if (P.parseUnsignedInteger(Index, LastLoc,
-          diag::sil_reverse_autodiff_expected_parameter_index))
-      return true;
-    ParamIndices.push_back(Index);
-    return false;
-  };
-  // Parse first.
-  if (parseParam())
-    return true;
-  // Parse rest.
-  while (P.consumeIf(tok::comma))
-    if (parseParam())
-      return true;
-
-  // Parse a SIL function name, e.g. '@foo'.
-  auto parseFnName = [&P, &LastLoc](Identifier &id) -> bool {
-    return P.parseToken(tok::at_sign, diag::expected_sil_function_name) ||
-      P.parseIdentifier(id, LastLoc, diag::expected_sil_function_name);
-  };
-
-  // Parse optional 'primal'.
-  Identifier PrimName;
-  if (P.Tok.is(tok::identifier) && P.Tok.getText() == "primal") {
-    P.consumeToken();
-    if (parseFnName(PrimName)) return true;
-  }
-  // Parse 'adjoint'.
-  Identifier AdjName;
-  if (P.parseSpecificIdentifier("adjoint", LastLoc,
-        diag::sil_attr_differentiable_expected_adjoint_identifier) ||
-      parseFnName(AdjName))
-    return true;
-  // Parse ']'.
-  if (P.parseToken(tok::r_square,
-                   diag::sil_attr_differentiable_expected_rsquare))
-    return true;
-  // Create an AdjointAttr and we are done.
-  auto *Attr = SILReverseDifferentiableAttr::create(
-      SP.SILMod, {SourceIndex, ParamIndices}, PrimName.str(), AdjName.str());
-  DAs.push_back(Attr);
-  return false;
-}
-
 static bool parseDeclSILOptional(bool *isTransparent,
                                  IsSerialized_t *isSerialized,
                                  bool *isCanonical,
@@ -1162,8 +888,6 @@ static bool parseDeclSILOptional(bool *isTransparent,
                                  bool *isLet, bool *isWeakLinked,
                                  SmallVectorImpl<std::string> *Semantics,
                                  SmallVectorImpl<ParsedSpecAttr> *SpecAttrs,
-                                 // SWIFT_ENABLE_TENSORFLOW
-                    SmallVectorImpl<SILReverseDifferentiableAttr *> *RDiffAttrs,
                                  ValueDecl **ClangDecl,
                                  EffectsKind *MRK, SILParser &SP) {
   while (SP.P.consumeIf(tok::l_square)) {
@@ -1252,13 +976,6 @@ static bool parseDeclSILOptional(bool *isTransparent,
                           : SILSpecializeAttr::SpecializationKind::Partial;
       SpecAttr.exported = Attr->isExported();
       SpecAttrs->emplace_back(SpecAttr);
-      continue;
-    }
-    // SWIFT_ENABLE_TENSORFLOW
-    else if (RDiffAttrs && SP.P.Tok.getText() == "reverse_differentiable") {
-      SP.P.consumeToken(tok::identifier);
-      if (parseReverseDifferentiableAttr(*RDiffAttrs, SP))
-        return true;
       continue;
     }
     else if (ClangDecl && SP.P.Tok.getText() == "clang") {
@@ -1517,6 +1234,8 @@ static Optional<AccessorKind> getAccessorKind(StringRef ident) {
            .Case("addressor", AccessorKind::Address)
            .Case("mutableAddressor", AccessorKind::MutableAddress)
            .Case("materializeForSet", AccessorKind::MaterializeForSet)
+           .Case("read", AccessorKind::Read)
+           .Case("modify", AccessorKind::Modify)
            .Default(None);
 }
 
@@ -2636,7 +2355,6 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     } else if (P.Tok.getText() == "objc_selector") {
       encoding = StringLiteralInst::Encoding::ObjCSelector;
     } else if (P.Tok.getText() == "bytes") {
-      // SWIFT_ENABLE_TENSORFLOW
       encoding = StringLiteralInst::Encoding::Bytes;
     } else {
       P.diagnose(P.Tok, diag::sil_string_invalid_encoding, P.Tok.getText());
@@ -2652,10 +2370,13 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     // Drop the double quotes.
     StringRef rawString = P.Tok.getText().drop_front().drop_back();
 
+    P.consumeToken(tok::string_literal);
+    if (parseSILDebugLocation(InstLoc, B))
+      return true;
+
     // Ask the lexer to interpret the entire string as a literal segment.
     SmallVector<char, 128> stringBuffer;
 
-    // SWIFT_ENABLE_TENSORFLOW
     if (encoding == StringLiteralInst::Encoding::Bytes) {
       // Decode hex bytes.
       if (rawString.size() & 1) {
@@ -2680,9 +2401,6 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     }
 
     StringRef string = P.L->getEncodedStringSegment(rawString, stringBuffer);
-    P.consumeToken(tok::string_literal);
-    if (parseSILDebugLocation(InstLoc, B))
-      return true;
     ResultVal = B.createStringLiteral(InstLoc, string, encoding);
     break;
   }
@@ -2795,86 +2513,6 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     ResultVal = B.createFunctionRef(InstLoc, Fn);
     break;
   }
-
-  // SWIFT_ENABLE_TENSORFLOW
-  case SILInstructionKind::GradientInst: {
-    // Parse optional [source <index>].
-    unsigned sourceIndex = 0;
-    SourceLoc sourceIndexLoc;
-    if (P.parseToken(tok::l_square, diag::expected_tok_in_sil_instr, "[") ||
-        parseVerbatim("source") ||
-        P.parseUnsignedInteger(sourceIndex, sourceIndexLoc,
-                               diag::sil_gradient_expected_source_index) ||
-        P.parseToken(tok::r_square, diag::expected_tok_in_sil_instr, "]"))
-      return true;
-    // Parse [wrt ...].
-    SmallVector<unsigned, 8> paramIndices;
-    if (P.parseToken(tok::l_square, diag::expected_tok_in_sil_instr, "[") ||
-        parseVerbatim("wrt"))
-      return true;
-    auto parseIndex = [&]() -> bool {
-      unsigned index;
-      SourceLoc indexLoc;
-      // TODO: Reject non-ascending parameter index lists.
-      if (P.parseUnsignedInteger(index, indexLoc,
-                           diag::sil_reverse_autodiff_expected_parameter_index))
-        return true;
-      paramIndices.push_back(index);
-      return false;
-    };
-    if (parseIndex())
-      return true;
-    while (P.consumeIf(tok::comma))
-      if (parseIndex())
-        return true;
-    if (P.parseToken(tok::r_square, diag::expected_tok_in_sil_instr, "]"))
-      return true;
-    // Parse optional [seedable], [preserving_result] and [delayed].
-    SILGradientOptions existingOptions;
-    auto parseOption = [&]() -> bool {
-      SILGradientOptions option =
-        llvm::StringSwitch<SILGradientOptions>(P.Tok.getText())
-          .Case("seedable", SILGradientFlags::Seedable)
-          .Case("preserving_result", SILGradientFlags::PreservingResult)
-          .Case("delayed", SILGradientFlags::Delayed)
-          .Default(None);
-      P.consumeToken(tok::identifier);
-      if (!option) {
-        P.diagnose(P.Tok, diag::sil_reverse_autodiff_expected_option);
-        return true;
-      }
-      if (existingOptions.contains(option)) {
-        P.diagnose(P.Tok, diag::sil_reverse_autodiff_duplicate_option);
-        return true;
-      }
-      existingOptions |= option;
-      return P.parseToken(tok::r_square, diag::expected_tok_in_sil_instr, "]");
-    };
-    while (P.consumeIf(tok::l_square))
-      if (parseOption())
-        return true;
-    // Parse original function value.
-    UnresolvedValueName originalName;
-    SILType originalTy;
-    SourceLoc originalTyLoc;
-    if (parseValueName(originalName) ||
-        P.parseToken(tok::colon, diag::expected_tok_in_sil_instr, ":") ||
-        parseSILType(originalTy, originalTyLoc))
-      return true;
-    auto originalFnTy = originalTy.getAs<SILFunctionType>();
-    if (!originalFnTy) {
-      P.diagnose(originalTyLoc, diag::expected_sil_type_kind, "be a function");
-      return true;
-    }
-    SILValue original = getLocalValue(originalName, originalTy, InstLoc, B);
-    if (parseSILDebugLocation(InstLoc, B))
-      return true;
-    SILReverseAutoDiffConfig config(
-      {sourceIndex, paramIndices}, existingOptions);
-    ResultVal = B.createGradient(InstLoc, original, config);
-    break;
-  }
-
   case SILInstructionKind::BuiltinInst: {
     if (P.Tok.getKind() != tok::string_literal) {
       P.diagnose(P.Tok, diag::expected_tok_in_sil_instr,"builtin name");
@@ -2883,46 +2521,36 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     StringRef Str = P.Tok.getText();
     Identifier Id = P.Context.getIdentifier(Str.substr(1, Str.size()-2));
     P.consumeToken(tok::string_literal);
-
+    
     // Find the builtin in the Builtin module
     SmallVector<ValueDecl*, 2> foundBuiltins;
     P.Context.TheBuiltinModule->lookupMember(foundBuiltins,
                                              P.Context.TheBuiltinModule, Id,
                                              Identifier());
-    // SWIFT_ENABLE_TENSORFLOW
-    SubstitutionMap subMap;
-    if (!foundBuiltins.empty()) {
-      assert(foundBuiltins.size() == 1 && "ambiguous builtin name?!");
-
-      auto *builtinFunc = cast<FuncDecl>(foundBuiltins[0]);
-      GenericEnvironment *genericEnv = builtinFunc->getGenericEnvironment();
-
-      SmallVector<ParsedSubstitution, 4> parsedSubs;
-      if (parseSubstitutions(parsedSubs))
-        return true;
-
-      if (!parsedSubs.empty()) {
-        if (!genericEnv) {
-          P.diagnose(P.Tok, diag::sil_substitutions_on_non_polymorphic_type);
-          return true;
-        }
-        subMap = getApplySubstitutionsFromParsed(*this, genericEnv, parsedSubs);
-        if (!subMap)
-          return true;
-      }
-      // SWIFT_ENABLE_TENSORFLOW: TODO: We can clean this up once Swift has a
-      // better understanding of the TensorFlow operations.
-    } else if (Id.str().startswith("__tfop") ||
-      // TODO: tf_tensor_to_i1 can become a named builtin in Builtins.def when
-      // TensorHandle become a builtin type.
-               Id.str() == "tf_tensor_to_i1") {
-      // TensorFlow builtins don't have a decl associated with them, and don't
-      // have substitutions.
-    } else {
-      P.diagnose(P.Tok, diag::expected_tok_in_sil_instr, "builtin name");
+    if (foundBuiltins.empty()) {
+      P.diagnose(P.Tok, diag::expected_tok_in_sil_instr,"builtin name");
       return true;
     }
+    assert(foundBuiltins.size() == 1 && "ambiguous builtin name?!");
 
+    auto *builtinFunc = cast<FuncDecl>(foundBuiltins[0]);
+    GenericEnvironment *genericEnv = builtinFunc->getGenericEnvironment();
+    
+    SmallVector<ParsedSubstitution, 4> parsedSubs;
+    SubstitutionMap subMap;
+    if (parseSubstitutions(parsedSubs))
+      return true;
+    
+    if (!parsedSubs.empty()) {
+      if (!genericEnv) {
+        P.diagnose(P.Tok, diag::sil_substitutions_on_non_polymorphic_type);
+        return true;
+      }
+      subMap = getApplySubstitutionsFromParsed(*this, genericEnv, parsedSubs);
+      if (!subMap)
+        return true;
+    }
+    
     if (P.Tok.getKind() != tok::l_paren) {
       P.diagnose(P.Tok, diag::expected_tok_in_sil_instr, "(");
       return true;
@@ -2959,90 +2587,6 @@ bool SILParser::parseSILInstruction(SILBuilder &B) {
     if (parseSILDebugLocation(InstLoc, B))
       return true;
     ResultVal = B.createBuiltin(InstLoc, Id, ResultTy, subMap, Args);
-    break;
-  }
-  // SWIFT_ENABLE_TENSORFLOW
-  case SILInstructionKind::GraphOperationInst: {
-    // Parse graph operation name.
-    if (P.Tok.isNot(tok::string_literal)) {
-      P.diagnose(P.Tok, diag::expected_tok_in_sil_instr, "graph_op name");
-      return true;
-    }
-    StringRef rawString = P.Tok.getText().drop_front().drop_back();
-    Identifier name = P.Context.getIdentifier(rawString);
-    P.consumeToken(tok::string_literal);
-
-    // Parse graph operation arguments.
-    if (P.Tok.isNot(tok::l_paren)) {
-      P.diagnose(P.Tok, diag::expected_tok_in_sil_instr, "(");
-      return true;
-    }
-    SmallVector<SILValue, 4> arguments;
-    SourceLoc lParenLoc = P.consumeToken(tok::l_paren);
-    SourceLoc rParenLoc;
-    ParserStatus status =
-      P.parseList(tok::r_paren, lParenLoc, rParenLoc,
-                  /*AllowSepAfterLast*/ false,
-                  diag::sil_graph_op_expected_rparen,
-                  SyntaxKind::TuplePatternElementList,
-                  [&]() -> ParserStatus {
-        SILValue value;
-        if (parseTypedValueRef(value, B))
-          return makeParserError();
-        arguments.push_back(value);
-        return makeParserSuccess();
-      });
-    if (status.isError())
-      return true;
-
-    // Parse optional graph operation attributes.
-    SmallVector<GraphOperationAttribute, 4> attributes;
-    SourceLoc lBraceLoc;
-    if (P.consumeIf(tok::l_brace, lBraceLoc)) {
-      SourceLoc rBraceLoc;
-      ParserStatus status =
-        P.parseList(tok::r_brace, lBraceLoc, rBraceLoc,
-                    /*AllowSepAfterLast*/ false,
-                    diag::sil_graph_op_expected_rbrace,
-                    SyntaxKind::Unknown,
-                    [&]() -> ParserStatus {
-        // Parse an attribute.
-        Identifier attrName;
-        if (parseSILIdentifier(attrName, lBraceLoc,
-                               diag::sil_graph_op_expected_attr_name))
-          return makeParserError();
-        SymbolicValue attrValue;
-        if (!P.consumeIf(tok::colon)) {
-          P.diagnose(P.Tok, diag::sil_graph_op_expected_colon_after_attr_name);
-          return makeParserError();
-        }
-        if (parseSymbolicValue(attrValue, *this, B))
-          return makeParserError();
-        attributes.push_back({ attrName, attrValue });
-        return makeParserSuccess();
-      });
-      if (status.isError())
-        return true;
-    }
-
-    // Parse graph operation result types.
-    if (P.parseToken(tok::colon,
-                     diag::sil_graph_op_expected_colon_before_result_types))
-      return true;
-    SmallVector<SILType, 4> resultTypes;
-    SILType temp;
-    while (true) {
-      if (parseSILType(temp))
-        return true;
-      resultTypes.push_back(temp);
-      if (!P.consumeIf(tok::comma))
-        break;
-    }
-
-    if (parseSILDebugLocation(InstLoc, B))
-      return true;
-    ResultVal = B.createGraphOperation(InstLoc, name, arguments, attributes,
-                                       resultTypes);
     break;
   }
   case SILInstructionKind::OpenExistentialAddrInst:
@@ -5565,7 +5109,6 @@ bool SILParser::parseSILBasicBlock(SILBuilder &B) {
         if (!F->getModule()
                  .getOptions()
                  .AssumeUnqualifiedOwnershipWhenParsing &&
-            F->getModule().getOptions().EnableSILOwnership &&
             parseSILOwnership(OwnershipKind))
           return true;
 
@@ -5647,8 +5190,6 @@ bool SILParserTUState::parseDeclSIL(Parser &P) {
   OptimizationMode optimizationMode = OptimizationMode::NotSet;
   SmallVector<std::string, 1> Semantics;
   SmallVector<ParsedSpecAttr, 4> SpecAttrs;
-  // SWIFT_ENABLE_TENSORFLOW
-  SmallVector<SILReverseDifferentiableAttr *, 4> RDiffAttrs;
   ValueDecl *ClangDecl = nullptr;
   EffectsKind MRK = EffectsKind::Unspecified;
   if (parseSILLinkage(FnLinkage, P) ||
@@ -5656,8 +5197,6 @@ bool SILParserTUState::parseDeclSIL(Parser &P) {
                            &isThunk, &isGlobalInit,
                            &inlineStrategy, &optimizationMode, nullptr,
                            &isWeakLinked, &Semantics, &SpecAttrs,
-                           // SWIFT_ENABLE_TENSORFLOW
-                           &RDiffAttrs,
                            &ClangDecl, &MRK, FunctionState) ||
       P.parseToken(tok::at_sign, diag::expected_sil_function_name) ||
       P.parseIdentifier(FnName, FnNameLoc, diag::expected_sil_function_name) ||
@@ -5687,9 +5226,6 @@ bool SILParserTUState::parseDeclSIL(Parser &P) {
     FunctionState.F->setWeakLinked(isWeakLinked);
     FunctionState.F->setInlineStrategy(inlineStrategy);
     FunctionState.F->setOptimizationMode(optimizationMode);
-    // SWIFT_ENABLE_TENSORFLOW
-    for (auto &Attr : RDiffAttrs)
-      FunctionState.F->addReverseDifferentiableAttr(Attr);
     FunctionState.F->setEffectsKind(MRK);
     if (ClangDecl)
       FunctionState.F->setClangNodeOwner(ClangDecl);
@@ -5865,10 +5401,9 @@ bool SILParserTUState::parseSILGlobal(Parser &P) {
   Scope S(&P, ScopeKind::TopLevel);
   SILParser State(P);
   if (parseSILLinkage(GlobalLinkage, P) ||
-      // SWIFT_ENABLE_TENSORFLOW
       parseDeclSILOptional(nullptr, &isSerialized, nullptr, nullptr, nullptr,
                            nullptr, nullptr, &isLet, nullptr, nullptr, nullptr,
-                           nullptr, nullptr, nullptr, State) ||
+                           nullptr, nullptr, State) ||
       P.parseToken(tok::at_sign, diag::expected_sil_value_name) ||
       P.parseIdentifier(GlobalName, NameLoc, diag::expected_sil_value_name) ||
       P.parseToken(tok::colon, diag::expected_sil_type))
@@ -5916,7 +5451,7 @@ bool SILParserTUState::parseSILProperty(Parser &P) {
   IsSerialized_t Serialized = IsNotSerialized;
   if (parseDeclSILOptional(nullptr, &Serialized, nullptr, nullptr, nullptr,
                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                           nullptr, nullptr, nullptr, SP))
+                           nullptr, nullptr, SP))
     return true;
   
   ValueDecl *VD;
@@ -5982,10 +5517,9 @@ bool SILParserTUState::parseSILVTable(Parser &P) {
   SILParser VTableState(P);
 
   IsSerialized_t Serialized = IsNotSerialized;
-  // SWIFT_ENABLE_TENSORFLOW
   if (parseDeclSILOptional(nullptr, &Serialized, nullptr, nullptr, nullptr,
                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                           nullptr, nullptr, nullptr, VTableState))
+                           nullptr, nullptr, VTableState))
     return true;
 
   // Parse the class name.
@@ -6333,10 +5867,9 @@ bool SILParserTUState::parseSILWitnessTable(Parser &P) {
   parseSILLinkage(Linkage, P);
   
   IsSerialized_t isSerialized = IsNotSerialized;
-  // SWIFT_ENABLE_TENSORFLOW
   if (parseDeclSILOptional(nullptr, &isSerialized, nullptr, nullptr, nullptr,
                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                           nullptr, nullptr, nullptr, WitnessState))
+                           nullptr, nullptr, WitnessState))
     return true;
 
   Scope S(&P, ScopeKind::TopLevel);

@@ -17,8 +17,6 @@
 #ifndef SWIFT_SIL_INSTRUCTION_H
 #define SWIFT_SIL_INSTRUCTION_H
 
-// SWIFT_ENABLE_TENSORFLOW
-#include "swift/AST/AutoDiff.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
@@ -53,10 +51,6 @@ class MultipleValueInstruction;
 class MultipleValueInstructionResult;
 class DestructureTupleInst;
 class DestructureStructInst;
-// SWIFT_ENABLE_TENSORFLOW
-class SymbolicValue;
-struct GraphOperationAttribute;
-class GraphOperationInst;
 class NonValueInstruction;
 class SILBasicBlock;
 class SILBuilder;
@@ -68,6 +62,7 @@ class SILInstructionResultArray;
 class SILOpenedArchetypesState;
 class SILType;
 class SILArgument;
+class SILPHIArgument;
 class SILUndef;
 class Stmt;
 class StringLiteralExpr;
@@ -1942,10 +1937,6 @@ public:
     return OperandValueArrayRef(opsWithoutSelf);
   }
 
-  SILArgumentConvention getArgumentConvention(unsigned index) const {
-    return getSubstCalleeConv().getSILArgumentConvention(index);
-  }
-
   Optional<SILResultInfo> getSingleResult() const {
     auto SubstCallee = getSubstCalleeType();
     if (SubstCallee->getNumAllResults() != 1)
@@ -2900,7 +2891,7 @@ class StringLiteralInst final
 
 public:
   enum class Encoding {
-    Bytes,   // SWIFT_ENABLE_TENSORFLOW
+    Bytes,
     UTF8,
     UTF16,
     /// UTF-8 encoding of an Objective-C selector.
@@ -6841,6 +6832,11 @@ public:
 
   unsigned getNumArgs() const { return getAllOperands().size(); }
   SILValue getArg(unsigned i) const { return getAllOperands()[i].get(); }
+
+  /// Return the SILPHIArgument for the given operand.
+  ///
+  /// See SILArgument.cpp.
+  const SILPHIArgument *getArgForOperand(const Operand *oper) const;
 };
 
 /// A conditional branch.
@@ -6981,6 +6977,15 @@ public:
   /// \p Index argument to DestBB.
   SILValue getArgForDestBB(const SILBasicBlock *DestBB,
                            unsigned ArgIndex) const;
+
+  /// Return the SILPHIArgument from either the true or false destination for
+  /// the given operand.
+  ///
+  /// Returns nullptr for an operand with no block argument
+  /// (i.e the branch condition).
+  ///
+  /// See SILArgument.cpp.
+  const SILPHIArgument *getArgForOperand(const Operand *oper) const;
 
   void swapSuccessors();
 };
@@ -7604,8 +7609,6 @@ public:
 
   bool isCalleeThin() const {
     switch (getSubstCalleeType()->getRepresentation()) {
-    // SWIFT_ENABLE_TENSORFLOW
-    case SILFunctionTypeRepresentation::TensorFlow:
     case SILFunctionTypeRepresentation::CFunctionPointer:
     case SILFunctionTypeRepresentation::Thin:
     case SILFunctionTypeRepresentation::Method:
@@ -7629,47 +7632,59 @@ public:
     FOREACH_IMPL_RETURN(getSubstitutionMap());
   }
 
-  /// The arguments passed to this instruction.
-  MutableArrayRef<Operand> getArgumentOperands() const {
-    FOREACH_IMPL_RETURN(getArgumentOperands());
-  }
-
-  /// The arguments passed to this instruction.
-  OperandValueArrayRef getArguments() const {
-    FOREACH_IMPL_RETURN(getArguments());
-  }
-
-  /// The number of call arguments.
-  unsigned getNumArguments() const {
-    FOREACH_IMPL_RETURN(getNumArguments());
-  }
-
-  unsigned getOperandIndexOfFirstArgument() {
-    FOREACH_IMPL_RETURN(getArgumentOperandNumber());
-  }
-
   /// Return the associated specialization information.
   const GenericSpecializationInformation *getSpecializationInfo() const {
     FOREACH_IMPL_RETURN(getSpecializationInfo());
   }
-#undef FOREACH_IMPL_RETURN
 
-  /// The arguments passed to this instruction, without self.
-  OperandValueArrayRef getArgumentsWithoutSelf() const {
-    switch (Inst->getKind()) {
-    case SILInstructionKind::ApplyInst:
-      return cast<ApplyInst>(Inst)->getArgumentsWithoutSelf();
-    case SILInstructionKind::BeginApplyInst:
-      return cast<BeginApplyInst>(Inst)->getArgumentsWithoutSelf();
-    case SILInstructionKind::TryApplyInst:
-      return cast<TryApplyInst>(Inst)->getArgumentsWithoutSelf();
-    default:
-      llvm_unreachable("not implemented for this instruction!");
-    }
+  /// Return an operand list corresponding to the applied arguments.
+  MutableArrayRef<Operand> getArgumentOperands() const {
+    FOREACH_IMPL_RETURN(getArgumentOperands());
   }
 
-  // Get the callee argument index corresponding to the caller's first applied
-  // argument. Returns 0 for full applies. May return > 0 for partial applies.
+  /// Return a list of applied argument values.
+  OperandValueArrayRef getArguments() const {
+    FOREACH_IMPL_RETURN(getArguments());
+  }
+
+  /// Return the number of applied arguments.
+  unsigned getNumArguments() const {
+    FOREACH_IMPL_RETURN(getNumArguments());
+  }
+
+  /// Return the apply operand for the given applied argument index.
+  Operand &getArgumentRef(unsigned i) const { return getArgumentOperands()[i]; }
+
+  /// Return the ith applied argument.
+  SILValue getArgument(unsigned i) const { return getArguments()[i]; }
+
+  /// Set the ith applied argument.
+  void setArgument(unsigned i, SILValue V) const {
+    getArgumentOperands()[i].set(V);
+  }
+
+  /// Return the operand index of the first applied argument.
+  unsigned getOperandIndexOfFirstArgument() const {
+    FOREACH_IMPL_RETURN(getArgumentOperandNumber());
+  }
+#undef FOREACH_IMPL_RETURN
+
+  /// Returns true if \p oper is an argument operand and not the callee
+  /// operand.
+  bool isArgumentOperand(const Operand &oper) const {
+    return oper.getOperandNumber() >= getOperandIndexOfFirstArgument();
+  }
+
+  /// Return the applied argument index for the given operand.
+  unsigned getAppliedArgIndex(const Operand &oper) const {
+    assert(oper.getUser() == Inst);
+    assert(isArgumentOperand(oper));
+
+    return oper.getOperandNumber() - getOperandIndexOfFirstArgument();
+  }
+
+  /// Return the callee's function argument index corresponding to the first
+  /// applied argument: 0 for full applies; >= 0 for partial applies.
   unsigned getCalleeArgIndexOfFirstAppliedArg() const {
     switch (Inst->getKind()) {
     case SILInstructionKind::ApplyInst:
@@ -7692,35 +7707,25 @@ public:
     }
   }
 
-  /// Returns true if \p oper is an argument operand and not the callee
-  /// operand.
-  bool isArgumentOperand(const Operand &oper) {
-    return oper.getOperandNumber() >= getOperandIndexOfFirstArgument();
+  /// Return the callee's function argument index corresponding to the given
+  /// apply operand. Each function argument index identifies a
+  /// SILFunctionArgument in the callee and can be used as a
+  /// SILFunctionConvention argument index.
+  ///
+  /// Note: Passing an applied argument index into SILFunctionConvention, as
+  /// opposed to a function argument index, is incorrect.
+  unsigned getCalleeArgIndex(const Operand &oper) const {
+    return getCalleeArgIndexOfFirstAppliedArg() + getAppliedArgIndex(oper);
   }
 
-  // Translate the index of the argument to the full apply or partial_apply into
-  // to the corresponding index into the arguments of the called function.
-  unsigned getCalleeArgIndex(const Operand &oper) {
-    assert(oper.getUser() == Inst);
-    assert(isArgumentOperand(oper));
-
-    unsigned appliedArgIdx =
-        oper.getOperandNumber() - getOperandIndexOfFirstArgument();
-
-    return getCalleeArgIndexOfFirstAppliedArg() + appliedArgIdx;
+  /// Return the SILArgumentConvention for the given applied argument operand.
+  SILArgumentConvention getArgumentConvention(Operand &oper) const {
+    unsigned calleeArgIdx =
+        getCalleeArgIndexOfFirstAppliedArg() + getAppliedArgIndex(oper);
+    return getSubstCalleeConv().getSILArgumentConvention(calleeArgIdx);
   }
 
-  Operand &getArgumentRef(unsigned i) const { return getArgumentOperands()[i]; }
-
-  /// Return the ith argument passed to this instruction.
-  SILValue getArgument(unsigned i) const { return getArguments()[i]; }
-
-  /// Set the ith argument of this instruction.
-  void setArgument(unsigned i, SILValue V) const {
-    getArgumentOperands()[i].set(V);
-  }
-
-  /// Return the self argument passed to this instruction.
+  /// Return true if 'self' is an applied argument.
   bool hasSelfArgument() const {
     switch (Inst->getKind()) {
     case SILInstructionKind::ApplyInst:
@@ -7734,7 +7739,7 @@ public:
     }
   }
 
-  /// Return the self argument passed to this instruction.
+  /// Return the applied 'self' argument value.
   SILValue getSelfArgument() const {
     switch (Inst->getKind()) {
     case SILInstructionKind::ApplyInst:
@@ -7748,7 +7753,7 @@ public:
     }
   }
 
-  /// Return the self operand passed to this instruction.
+  /// Return the 'self' apply operand.
   Operand &getSelfArgumentOperand() {
     switch (Inst->getKind()) {
     case SILInstructionKind::ApplyInst:
@@ -7762,8 +7767,18 @@ public:
     }
   }
 
-  SILArgumentConvention getArgumentConvention(unsigned index) const {
-    return getSubstCalleeConv().getSILArgumentConvention(index);
+  /// Return a list of applied arguments without self.
+  OperandValueArrayRef getArgumentsWithoutSelf() const {
+    switch (Inst->getKind()) {
+    case SILInstructionKind::ApplyInst:
+      return cast<ApplyInst>(Inst)->getArgumentsWithoutSelf();
+    case SILInstructionKind::BeginApplyInst:
+      return cast<BeginApplyInst>(Inst)->getArgumentsWithoutSelf();
+    case SILInstructionKind::TryApplyInst:
+      return cast<TryApplyInst>(Inst)->getArgumentsWithoutSelf();
+    default:
+      llvm_unreachable("not implemented for this instruction!");
+    }
   }
 
   static ApplySite getFromOpaqueValue(void *p) {
@@ -7835,65 +7850,6 @@ public:
     return (inst->getKind() == SILInstructionKind::ApplyInst ||
             inst->getKind() == SILInstructionKind::BeginApplyInst ||
             inst->getKind() == SILInstructionKind::TryApplyInst);
-  }
-};
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// GradientInst - Represents the gradient of another SIL function.
-class GradientInst final
-  : public InstructionBase<SILInstructionKind::GradientInst,
-                           SingleValueInstruction> {
-private:
-  friend SILBuilder;
-  /// The reverse-mode AD configuration.
-  SILReverseAutoDiffConfig Config;
-  /// Space for 1 operand: the original function to be differentiated.
-  FixedOperandList<1> Operands;
-
-  GradientInst(SILModule &module, SILDebugLocation debugLoc, SILValue original,
-               const SILReverseAutoDiffConfig &config);
-
-  /// A utility function for computing the SIL type of the gradient of a
-  /// function, given the specified differentiation configuration options.
-  static SILType getGradientSILType(
-      SILModule &module, SILValue original,
-      const SILReverseAutoDiffConfig &config);
-
-public:
-  ~GradientInst() {};
-
-  static GradientInst *create(SILModule &M, SILDebugLocation debugLoc,
-                              SILValue original,
-                              const SILReverseAutoDiffConfig &config);
-
-  SILValue getOriginal() const { return Operands[0].get(); }
-
-  CanSILFunctionType getOriginalType() const {
-    return getOriginal()->getType().getAs<SILFunctionType>();
-  }
-
-  const SILReverseAutoDiffConfig &getConfig() const {
-    return Config;
-  }
-
-  const SILReverseAutoDiffIndices &getIndices() const {
-    return Config.indices;
-  }
-
-  SILGradientOptions getOptions() const {
-    return Config.options;
-  }
-
-  ArrayRef<Operand> getAllOperands() const {
-    return Operands.asArray();
-  }
-
-  MutableArrayRef<Operand> getAllOperands() {
-    return Operands.asArray();
-  }
-
-  static bool classof(const SILNode *N) {
-    return N->getKind() == SILNodeKind::GradientInst;
   }
 };
 
@@ -8032,103 +7988,6 @@ inline DestructureTupleInst *DestructureTupleResult::getParent() {
   return cast<DestructureTupleInst>(Parent);
 }
 
-/// SWIFT_ENABLE_TENSORFLOW
-/// A result for the graph_op instruction. See documentation for
-/// graph_op for more information.
-class GraphOperationResult final : public MultipleValueInstructionResult {
-public:
-  GraphOperationResult(unsigned Index, SILType Type,
-                       ValueOwnershipKind OwnershipKind)
-  : MultipleValueInstructionResult(ValueKind::GraphOperationResult, Index,
-                                   Type, OwnershipKind) {}
-
-  static bool classof(const SILNode *N) {
-    return N->getKind() == SILNodeKind::GraphOperationResult;
-  }
-
-  GraphOperationInst *getParent() {
-    auto *Parent = MultipleValueInstructionResult::getParent();
-    return cast<GraphOperationInst>(Parent);
-  };
-
-  const GraphOperationInst *getParent() const {
-    return const_cast<GraphOperationResult *>(this)->getParent();
-  }
-};
-
-/// SWIFT_ENABLE_TENSORFLOW
-/// A graph operation. This instruction will be extracted to a graph program
-/// via graph program extraction passes.
-class GraphOperationInst final
-  : public InstructionBase<
-               SILInstructionKind::GraphOperationInst,
-               MultipleValueInstruction>,
-    public MultipleValueInstructionTrailingObjects<
-               GraphOperationInst, GraphOperationResult,
-               InitialTrailingObjects<>,
-               FinalTrailingObjects<Operand>> {
-  friend TrailingObjects;
-
-  /// The name of the graph operation.
-  Identifier Name;
-  /// The number of operands.
-  unsigned NumOperands;
-  /// The attributes of the graph operation.
-  MutableArrayRef<GraphOperationAttribute> Attributes;
-
-  GraphOperationInst(SILModule &M, SILDebugLocation loc, Identifier name,
-                     ArrayRef<SILValue> arguments,
-                     ArrayRef<GraphOperationAttribute> attrs,
-                     ArrayRef<SILType> resultTypes,
-                     ArrayRef<ValueOwnershipKind> resultOwnerships);
-
-public:
-  using MultipleValueInstructionTrailingObjects::numTrailingObjects;
-  using MultipleValueInstructionTrailingObjects::totalSizeToAlloc;
-
-  ~GraphOperationInst();
-  static GraphOperationInst *create(SILModule &M, SILDebugLocation loc,
-                                    Identifier name,
-                                    ArrayRef<SILValue> arguments,
-                                    ArrayRef<GraphOperationAttribute> attrs,
-                                    ArrayRef<SILType> resultTypes);
-
-  Identifier getName() const { return Name; }
-  unsigned getNumOperands() const { return NumOperands; }
-  unsigned getNumAttributes() const { return Attributes.size(); }
-
-  unsigned numTrailingObjects(OverloadToken<Operand>) const {
-    return NumOperands;
-  }
-
-  ArrayRef<Operand> getAllOperands() const {
-    return { getTrailingObjects<Operand>(), NumOperands };
-  }
-
-  MutableArrayRef<Operand> getAllOperands() {
-    return { getTrailingObjects<Operand>(), NumOperands };
-  }
-
-  OperandValueArrayRef getArguments() const {
-    return OperandValueArrayRef(getAllOperands());
-  }
-  GraphOperationAttribute getAttribute(unsigned i) const;
-
-  ArrayRef<GraphOperationAttribute> getAttributes() const {
-    return Attributes;
-  }
-
-  MutableArrayRef<GraphOperationAttribute> getAttributes() {
-    return Attributes;
-  }
-
-  Optional<SymbolicValue> getAttributeNamed(StringRef name);
-
-  static bool classof(const SILNode *N) {
-    return N->getKind() == SILNodeKind::GraphOperationInst;
-  }
-};
-
 inline SILType *AllocRefInstBase::getTypeStorage() {
   // If the size of the subclasses are equal, then all of this compiles away.
   if (auto I = dyn_cast<AllocRefInst>(this))
@@ -8202,7 +8061,7 @@ namespace llvm {
 
 template <>
 struct ilist_traits<::swift::SILInstruction> :
-  public ilist_default_traits<::swift::SILInstruction> {
+  public ilist_node_traits<::swift::SILInstruction> {
   using SILInstruction = ::swift::SILInstruction;
 
 private:
