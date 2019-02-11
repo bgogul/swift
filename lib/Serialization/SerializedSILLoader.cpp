@@ -31,7 +31,7 @@ SerializedSILLoader::SerializedSILLoader(
       if (auto LoadedAST = dyn_cast<SerializedASTFile>(File)) {
         auto Des = new SILDeserializer(&LoadedAST->File, *SILMod, callbacks);
 #ifndef NDEBUG
-        SILMod->verify();
+//        SILMod->verify();
 #endif
         LoadedSILSections.emplace_back(Des);
       }
@@ -180,4 +180,3 @@ void SerializedSILLoader::getAllProperties() {
   for (auto &Des : LoadedSILSections)
     Des->getAllProperties();
 }
-
